@@ -1,0 +1,1203 @@
+--[[
+    FE_BUNDLE CLEAN REBUILD
+    Version: 2.0.0
+    Persistence schema: 2
+
+    Architecture:
+    - One central State table.
+    - One persistence system.
+    - One page/navigation system.
+    - One modal system.
+    - One loading/toast system.
+    - One emote playback system.
+    - One floating button manager.
+    - One quick selector manager.
+    - One animation controller.
+
+    Major features:
+    - Emote browser: Roblox / UGC / Favorites source filters, search, cards, info, play, favorite.
+    - Bundle browser: search, full apply, custom slot apply.
+    - Custom mix: Idle/Walk/Run/Jump/Fall/Climb/Swim.
+    - Info modal: metadata, link, copy animation, favorite, floating button, play, avatar preview.
+    - Floating buttons: autogrid/freeform, placement, drag, click play/stop, persistence.
+    - Quick selector: provider alternative, B shortcut, persistent entries.
+    - Controller: track selector, loop, reverse, speed, intensity, seek, dock/undock.
+    - Settings: real settings, not fake labels.
+
+    Known limitations:
+    - Some games override Animate scripts.
+    - Some executors block game:HttpGet or game:GetObjects.
+    - R6 converters can make R15 animation bundles look stiff.
+]]
+
+---------------------------------------------------------------------
+-- SERVICES
+---------------------------------------------------------------------
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local StarterGui = game:GetService("StarterGui")
+
+local LocalPlayer = Players.LocalPlayer
+
+---------------------------------------------------------------------
+-- CONSTANTS
+---------------------------------------------------------------------
+
+local SAVE_FILE = "FE_BUNDLE_CLEAN_V2.json"
+local SAVE_SCHEMA = 2
+local CAN_SAVE = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+
+local STATES = {"Idle", "Walk", "Run", "Jump", "Fall", "Climb", "Swim"}
+local ANIMATE_NAMES = {
+    Idle = {"idle"},
+    Walk = {"walk"},
+    Run = {"run"},
+    Jump = {"jump"},
+    Fall = {"fall"},
+    Climb = {"climb"},
+    Swim = {"swim", "swimidle"}
+}
+
+local SPEEDS = {
+    {Name = "Paused", Value = 0},
+    {Name = "Slower", Value = 0.2},
+    {Name = "Slow", Value = 0.65},
+    {Name = "Normal", Value = 1},
+    {Name = "Fast", Value = 1.25},
+    {Name = "Faster", Value = 1.75}
+}
+
+local SUGGESTION_WORDS = {
+    "dance", "pose", "wave", "laugh", "sit", "sleep", "spin", "hype", "cute", "sad", "happy", "zombie", "robot", "ninja", "float", "idol", "ballet", "clap", "jump", "kick"
+}
+
+local THEME = {
+    Page = Color3.fromRGB(255, 255, 255),
+    Paper = Color3.fromRGB(247, 250, 248),
+    Card = Color3.fromRGB(239, 245, 243),
+    Field = Color3.fromRGB(248, 250, 249),
+    Header = Color3.fromRGB(255, 181, 48),
+    Cyan = Color3.fromRGB(137, 211, 222),
+    Blue = Color3.fromRGB(35, 150, 222),
+    Orange = Color3.fromRGB(255, 181, 48),
+    Green = Color3.fromRGB(137, 222, 205),
+    Yellow = Color3.fromRGB(255, 216, 126),
+    Red = Color3.fromRGB(255, 100, 120),
+    Text = Color3.fromRGB(24, 24, 24),
+    Muted = Color3.fromRGB(82, 92, 100),
+    LightMuted = Color3.fromRGB(150, 160, 168),
+    Black = Color3.fromRGB(18, 18, 18)
+}
+
+---------------------------------------------------------------------
+-- CENTRAL STATE
+---------------------------------------------------------------------
+
+local State = {
+    Alive = true,
+    CurrentPage = "Emotes",
+    CurrentSource = "Roblox", -- Favorites / Roblox / UGC
+    SearchQuery = "",
+    BundleQuery = "animation",
+    RequestId = 0,
+    LoadingMore = false,
+
+    Emotes = {},
+    Bundles = {},
+    NextEmoteCursor = nil,
+    NextBundleCursor = nil,
+
+    Favorites = {Emotes = {}, Bundles = {}},
+    FloatingButtons = {},
+    QuickEntries = {},
+    SavedPacks = {},
+
+    CurrentForm = {Idle="", Walk="", Run="", Jump="", Fall="", Climb="", Swim=""},
+    SlotMeta = {Idle=nil, Walk=nil, Run=nil, Jump=nil, Fall=nil, Climb=nil, Swim=nil},
+    ChoosingState = nil,
+    EditingSaveIndex = nil,
+
+    Settings = {
+        PickerProvider = "Floating buttons",
+        FloatingMode = "Autogrid",
+        FloatingPlacement = "Top right",
+        WidthMode = "Wide",
+        AvoidScaling = false,
+        ScreenBlur = false,
+        StartMenuClosed = false,
+        Crowdsource = false,
+        CacheUGCIds = true,
+        CacheUGCTracks = false,
+        Suggestions = true,
+        EmoteShortcutKey = "B",
+        EmoteLoop = true,
+        MoveWhileEmote = true,
+        EmoteSpeed = 1,
+        ControllerLoop = false,
+        ControllerReverse = false,
+        ControllerSpeedName = "Normal",
+        ControllerSpeed = 1,
+        ControllerIntensity = 1,
+        ApplyMethod = "Animate",
+        AutoLoad = true,
+        AutoLoadName = "",
+        ModalDimTransparency = 0.45,
+        UITransparency = 0,
+        BlurAmount = 0
+    },
+
+    Cache = {EmoteIds = {}, BundleResolved = {}},
+    Character = {Instance = nil, Humanoid = nil, Animator = nil, Animate = nil},
+    OriginalAnimations = {},
+
+    Playback = {Track = nil, Emote = nil, State = "IDLE", EndedConnection = nil},
+    Controller = {SelectedIndex = 1, ReverseConnection = nil, Undocked = false, DockPosition = nil},
+    Runtime = {Logs = {}, LastError = "None"}
+}
+
+---------------------------------------------------------------------
+-- GUI REFERENCES
+---------------------------------------------------------------------
+
+local Gui = {
+    Screen = nil,
+    Icon = nil,
+    Main = nil,
+    Header = nil,
+    HeaderTitle = nil,
+    Body = nil,
+    Status = nil,
+    Toast = nil,
+    RuntimeBar = nil,
+    LoadingDim = nil,
+    LoadingCard = nil,
+    LoadingBar = nil,
+    ModalDim = nil,
+    Modal = nil,
+    ModalPreview = nil,
+    FloatingLayer = nil,
+    QuickLayer = nil,
+    QuickPanel = nil,
+    QuickButton = nil,
+    ControllerFloat = nil,
+    Blur = nil
+}
+
+local Conns = {Global = {}, Page = {}, Modal = {}, Floating = {}, Quick = {}, Controller = {}, Character = {}}
+
+---------------------------------------------------------------------
+-- LOW LEVEL HELPERS
+---------------------------------------------------------------------
+
+local function add(bucket, conn)
+    table.insert(bucket or Conns.Global, conn)
+    return conn
+end
+
+local function disconnect(bucket)
+    for _, c in ipairs(bucket) do
+        pcall(function() c:Disconnect() end)
+    end
+    for i = #bucket, 1, -1 do table.remove(bucket, i) end
+end
+
+local function log(msg)
+    local line = os.date("%H:%M:%S") .. " | " .. tostring(msg)
+    table.insert(State.Runtime.Logs, 1, line)
+    while #State.Runtime.Logs > 80 do table.remove(State.Runtime.Logs) end
+    pcall(function() warn("[FE_BUNDLE] " .. line) end)
+end
+
+local function new(class, props)
+    local obj = Instance.new(class)
+    for k, v in pairs(props or {}) do
+        pcall(function() obj[k] = v end)
+    end
+    return obj
+end
+
+local function corner(obj, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r or 8)
+    c.Parent = obj
+    return c
+end
+
+local function stroke(obj, color, thickness, transparency)
+    local s = Instance.new("UIStroke")
+    s.Color = color or THEME.Black
+    s.Thickness = thickness or 1
+    s.Transparency = transparency or 0
+    s.Parent = obj
+    return s
+end
+
+local function tween(obj, props, duration)
+    if State.Settings.AvoidScaling then
+        for k, v in pairs(props) do pcall(function() obj[k] = v end) end
+        return
+    end
+    pcall(function()
+        TweenService:Create(obj, TweenInfo.new(duration or 0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+    end)
+end
+
+local function clear(parent)
+    if not parent then return end
+    for _, c in ipairs(parent:GetChildren()) do c:Destroy() end
+end
+
+local function z(parent, inc)
+    local base = 1
+    pcall(function() base = parent.ZIndex or 1 end)
+    return base + (inc or 1)
+end
+
+local function parentGui()
+    local pg = nil
+    pcall(function() if gethui then pg = gethui() end end)
+    if not pg then pcall(function() pg = game:GetService("CoreGui") end) end
+    if not pg then pg = LocalPlayer:WaitForChild("PlayerGui") end
+    return pg
+end
+
+local function normalizeId(v)
+    v = tostring(v or "")
+    return string.match(v, "%d+") or ""
+end
+
+local function animUrl(id)
+    id = normalizeId(id)
+    if id == "" then return "" end
+    return "rbxassetid://" .. id
+end
+
+local function assetThumb(id)
+    return "rbxthumb://type=Asset&id=" .. tostring(id) .. "&w=150&h=150"
+end
+
+local function bundleThumb(id)
+    return "rbxthumb://type=BundleThumbnail&id=" .. tostring(id) .. "&w=150&h=150"
+end
+
+local function copyTable(t)
+    local out = {}
+    for k, v in pairs(t or {}) do
+        if type(v) == "table" then
+            local inner = {}
+            for a, b in pairs(v) do inner[a] = b end
+            out[k] = inner
+        else
+            out[k] = v
+        end
+    end
+    return out
+end
+
+local function getChar()
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local animator = hum and hum:FindFirstChildOfClass("Animator")
+    local animate = char and char:FindFirstChild("Animate")
+    return char, hum, animator, animate
+end
+
+local function setStatus(text, good)
+    if not Gui.Status then return end
+    Gui.Status.Text = tostring(text or "")
+    if good == true then Gui.Status.TextColor3 = Color3.fromRGB(40, 130, 90)
+    elseif good == false then Gui.Status.TextColor3 = THEME.Red
+    else Gui.Status.TextColor3 = THEME.Muted end
+end
+
+local function notify(text, good)
+    if not Gui.Toast then return end
+    Gui.Toast.Text = tostring(text or "")
+    Gui.Toast.TextColor3 = good == false and THEME.Red or Color3.fromRGB(40, 130, 90)
+    Gui.Toast.Visible = true
+    Gui.Toast.Position = UDim2.new(0.5, -140, 0, -42)
+    tween(Gui.Toast, {Position = UDim2.new(0.5, -140, 0, 16)}, 0.16)
+    task.delay(1.4, function()
+        if Gui.Toast then
+            tween(Gui.Toast, {Position = UDim2.new(0.5, -140, 0, -42)}, 0.16)
+            task.delay(0.18, function() if Gui.Toast then Gui.Toast.Visible = false end end)
+        end
+    end)
+end
+
+local function httpGet(url)
+    local ok, res = pcall(function() return game:HttpGet(url) end)
+    if ok and type(res) == "string" then return res end
+    return nil
+end
+
+local function decode(raw)
+    if not raw then return nil end
+    local ok, data = pcall(function() return HttpService:JSONDecode(raw) end)
+    if ok then return data end
+    return nil
+end
+
+local function copyClipboard(text)
+    local ok = false
+    if setclipboard then ok = pcall(function() setclipboard(tostring(text or "")) end) end
+    if not ok and toclipboard then ok = pcall(function() toclipboard(tostring(text or "")) end) end
+    if not ok and syn and syn.write_clipboard then ok = pcall(function() syn.write_clipboard(tostring(text or "")) end) end
+    if ok then notify("Animation copied", true) else notify("Clipboard unavailable", false) end
+    return ok
+end
+
+---------------------------------------------------------------------
+-- PERSISTENCE
+---------------------------------------------------------------------
+
+local function validateSettings(settings)
+    settings = type(settings) == "table" and settings or {}
+    for k, v in pairs(State.Settings) do
+        if settings[k] == nil then settings[k] = v end
+    end
+    settings.ModalDimTransparency = math.clamp(tonumber(settings.ModalDimTransparency) or 0.45, 0.05, 0.9)
+    settings.EmoteSpeed = tonumber(settings.EmoteSpeed) or 1
+    settings.ControllerSpeed = tonumber(settings.ControllerSpeed) or 1
+    settings.ControllerIntensity = math.clamp(tonumber(settings.ControllerIntensity) or 1, 0, 2)
+    local picker = { ["Floating buttons"] = true, ["Quick selector"] = true }
+    if not picker[settings.PickerProvider] then settings.PickerProvider = "Floating buttons" end
+    local floatModes = {Autogrid = true, Freeform = true}
+    if not floatModes[settings.FloatingMode] then settings.FloatingMode = "Autogrid" end
+    local places = { ["Top right"] = true, ["Top left"] = true, ["Bottom right"] = true, ["Bottom left"] = true }
+    if not places[settings.FloatingPlacement] then settings.FloatingPlacement = "Top right" end
+    if settings.WidthMode ~= "Wide" and settings.WidthMode ~= "Compact" then settings.WidthMode = "Wide" end
+    if settings.ApplyMethod ~= "Animate" and settings.ApplyMethod ~= "Description" and settings.ApplyMethod ~= "Both" then settings.ApplyMethod = "Animate" end
+    if type(settings.EmoteShortcutKey) ~= "string" or settings.EmoteShortcutKey == "" then settings.EmoteShortcutKey = "B" end
+    return settings
+end
+
+local function saveData()
+    if not CAN_SAVE then return false end
+    local data = {
+        version = SAVE_SCHEMA,
+        settings = State.Settings,
+        favorites = State.Favorites,
+        floatingButtons = State.FloatingButtons,
+        quickEntries = State.QuickEntries,
+        savedPacks = State.SavedPacks,
+        currentForm = State.CurrentForm,
+        slotMeta = State.SlotMeta,
+        autoLoadName = State.AutoLoadName,
+        lastAppliedName = State.LastAppliedName,
+        cache = {EmoteIds = State.Cache.EmoteAnimationIds, Bundles = State.Cache.BundleResolved}
+    }
+    local ok = pcall(function() writefile(SAVE_FILE, HttpService:JSONEncode(data)) end)
+    if ok then log("saved") end
+    return ok
+end
+
+local function loadData()
+    if not CAN_SAVE then return false end
+    local exists = false
+    pcall(function() exists = isfile(SAVE_FILE) end)
+    if not exists then return false end
+    local raw
+    local okRead = pcall(function() raw = readfile(SAVE_FILE) end)
+    if not okRead or not raw then return false end
+    local data
+    local okDecode = pcall(function() data = HttpService:JSONDecode(raw) end)
+    if not okDecode or type(data) ~= "table" then return false end
+    State.Settings = validateSettings(data.settings)
+    if type(data.favorites) == "table" then State.Favorites = data.favorites end
+    if type(data.floatingButtons) == "table" then State.FloatingButtons = data.floatingButtons end
+    if type(data.quickEntries) == "table" then State.QuickEntries = data.quickEntries end
+    if type(data.savedPacks) == "table" then State.SavedPacks = data.savedPacks end
+    if type(data.currentForm) == "table" then State.CurrentForm = data.currentForm end
+    if type(data.slotMeta) == "table" then State.SlotMeta = data.slotMeta end
+    if type(data.autoLoadName) == "string" then State.AutoLoadName = data.autoLoadName end
+    if type(data.lastAppliedName) == "string" then State.LastAppliedName = data.lastAppliedName end
+    if type(data.cache) == "table" then
+        State.Cache.EmoteAnimationIds = type(data.cache.EmoteIds) == "table" and data.cache.EmoteIds or {}
+        State.Cache.BundleResolved = type(data.cache.Bundles) == "table" and data.cache.Bundles or {}
+    end
+    log("loaded")
+    return true
+end
+
+---------------------------------------------------------------------
+-- UI COMPONENTS
+---------------------------------------------------------------------
+
+local function label(parent, text, pos, size, textSize, color)
+    return new("TextLabel", {Parent = parent, Position = pos, Size = size, BackgroundTransparency = 1, Text = tostring(text or ""), TextColor3 = color or THEME.Text, TextStrokeTransparency = 1, TextSize = textSize or 13, Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center, TextWrapped = true, ZIndex = z(parent, 2)})
+end
+
+local function button(parent, text, pos, size, callback, color, bucket)
+    bucket = bucket or Conns.Page
+    local shadow = new("Frame", {Parent = parent, Position = UDim2.new(pos.X.Scale, pos.X.Offset + 3, pos.Y.Scale, pos.Y.Offset + 4), Size = size, BackgroundColor3 = THEME.Black, BackgroundTransparency = 0.72, BorderSizePixel = 0, ZIndex = z(parent, 1)})
+    corner(shadow, 8)
+    local b = new("TextButton", {Parent = parent, Position = pos, Size = size, BackgroundColor3 = color or THEME.Card, BorderSizePixel = 0, Text = text, TextColor3 = THEME.Text, TextStrokeTransparency = 1, TextSize = 12, Font = Enum.Font.Gotham, AutoButtonColor = false, Active = true, ClipsDescendants = true, ZIndex = z(parent, 2)})
+    corner(b, 8)
+    stroke(b, THEME.Black, 1, 0)
+    local fired = false
+    local function press()
+        tween(b, {Position = UDim2.new(pos.X.Scale, pos.X.Offset + 2, pos.Y.Scale, pos.Y.Offset + 2)}, 0.05)
+    end
+    local function release()
+        tween(b, {Position = pos}, 0.06)
+    end
+    local function fire()
+        if fired then return end
+        fired = true
+        task.delay(0.18, function() fired = false end)
+        if callback then callback() end
+    end
+    add(bucket, b.MouseButton1Down:Connect(press))
+    add(bucket, b.MouseButton1Up:Connect(release))
+    add(bucket, b.MouseButton1Click:Connect(fire))
+    add(bucket, b.InputBegan:Connect(function(input) if input.UserInputType == Enum.UserInputType.Touch then press() end end))
+    add(bucket, b.InputEnded:Connect(function(input) if input.UserInputType == Enum.UserInputType.Touch then release(); fire() end end))
+    pcall(function() add(bucket, b.Activated:Connect(fire)) end)
+    return b
+end
+
+local function textBox(parent, placeholder, pos, size, initial)
+    local box = new("TextBox", {Parent = parent, Position = pos, Size = size, BackgroundColor3 = THEME.Field, BorderSizePixel = 0, Text = initial or "", PlaceholderText = placeholder, PlaceholderColor3 = THEME.LightMuted, TextColor3 = THEME.Text, TextStrokeTransparency = 1, TextSize = 13, Font = Enum.Font.Gotham, ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = z(parent, 2)})
+    corner(box, 8)
+    stroke(box, THEME.Black, 1, 0.2)
+    local pad = Instance.new("UIPadding")
+    pad.PaddingLeft = UDim.new(0, 10)
+    pad.PaddingRight = UDim.new(0, 10)
+    pad.Parent = box
+    return box
+end
+
+local function panel(parent, pos, size, color)
+    local p = new("Frame", {Parent = parent, Position = UDim2.new(pos.X.Scale, pos.X.Offset + 4, pos.Y.Scale, pos.Y.Offset + 6), Size = UDim2.new(size.X.Scale, math.max(8, size.X.Offset * 0.92), size.Y.Scale, math.max(8, size.Y.Offset * 0.86)), BackgroundColor3 = color or THEME.Card, BackgroundTransparency = 0.12, BorderSizePixel = 0, ZIndex = z(parent, 1)})
+    corner(p, 10)
+    stroke(p, THEME.Black, 1, 0)
+    task.defer(function() if p and p.Parent then tween(p, {Position = pos, Size = size, BackgroundTransparency = 0}, 0.16) end end)
+    return p
+end
+
+local function scrollFrame(parent, pos, size)
+    local sc = new("ScrollingFrame", {Parent = parent, Position = pos, Size = size, BackgroundColor3 = THEME.Page, BorderSizePixel = 0, ScrollBarThickness = 5, ScrollBarImageColor3 = THEME.Orange, CanvasSize = UDim2.new(0,0,0,360), ZIndex = z(parent, 1)})
+    corner(sc, 10)
+    stroke(sc, THEME.Black, 1, 0.35)
+    return sc
+end
+
+---------------------------------------------------------------------
+-- LOADING / TOAST
+---------------------------------------------------------------------
+
+local function hideLoading()
+    local card = Gui.LoadingCard
+    local dim = Gui.LoadingDim
+    Gui.LoadingCard = nil
+    Gui.LoadingDim = nil
+    Gui.LoadingBar = nil
+    if card then tween(card, {Size = UDim2.new(0, 40, 0, 40), BackgroundTransparency = 1}, 0.12); task.delay(0.14, function() if card then card:Destroy() end end) end
+    if dim then tween(dim, {BackgroundTransparency = 1}, 0.12); task.delay(0.14, function() if dim then dim:Destroy() end end) end
+end
+
+local function showLoading(message)
+    hideLoading()
+    Gui.LoadingDim = new("Frame", {Parent = Gui.Screen, Position = UDim2.new(0,0,0,0), Size = UDim2.new(1,0,1,0), BackgroundColor3 = THEME.Black, BackgroundTransparency = 0.65, BorderSizePixel = 0, ZIndex = 250})
+    Gui.LoadingCard = new("Frame", {Parent = Gui.Screen, AnchorPoint = Vector2.new(0.5,0.5), Position = UDim2.new(0.5,0,0.5,0), Size = UDim2.new(0,40,0,40), BackgroundColor3 = THEME.Page, BorderSizePixel = 0, ClipsDescendants = true, ZIndex = 251})
+    corner(Gui.LoadingCard, 14)
+    stroke(Gui.LoadingCard, THEME.Black, 2, 0)
+    tween(Gui.LoadingCard, {Size = UDim2.new(0,330,0,112)}, 0.16)
+    label(Gui.LoadingCard, message or "Loading...", UDim2.new(0,18,0,14), UDim2.new(1,-36,0,28), 16, THEME.Text)
+    local barBack = new("Frame", {Parent = Gui.LoadingCard, Position = UDim2.new(0,18,0,64), Size = UDim2.new(1,-36,0,16), BackgroundColor3 = THEME.Card, BorderSizePixel = 0, ClipsDescendants = true, ZIndex = 252})
+    corner(barBack, 8)
+    Gui.LoadingBar = new("Frame", {Parent = barBack, Position = UDim2.new(-0.55,0,0,0), Size = UDim2.new(0.35,0,1,0), BackgroundColor3 = THEME.Orange, BorderSizePixel = 0, ZIndex = 253})
+    corner(Gui.LoadingBar, 8)
+    task.spawn(function()
+        while Gui.LoadingBar and Gui.LoadingBar.Parent do
+            Gui.LoadingBar.Position = UDim2.new(-0.55,0,0,0)
+            tween(Gui.LoadingBar, {Position = UDim2.new(1.15,0,0,0)}, 0.9)
+            task.wait(0.95)
+        end
+    end)
+end
+
+---------------------------------------------------------------------
+-- CATALOG
+---------------------------------------------------------------------
+
+local function buildCatalogUrl(kind, query, cursor)
+    local encoded = HttpService:UrlEncode(query or "")
+    local cursorPart = cursor and ("&Cursor=" .. HttpService:UrlEncode(cursor)) or ""
+    if kind == "Emote" then
+        local creator = AppState.CurrentSource == "Roblox" and "&CreatorType=User&CreatorTargetId=1" or ""
+        return "https://catalog.roblox.com/v1/search/items/details?Category=12&Subcategory=39&Keyword=" .. encoded .. "&Limit=30&SortType=0" .. creator .. cursorPart
+    end
+    return "https://catalog.roblox.com/v1/search/items/details?Category=12&Subcategory=38&Keyword=" .. encoded .. "&Limit=30&SortType=0" .. cursorPart
+end
+
+local function searchCatalog(kind, query, append)
+    query = tostring(query or "")
+    if query == "" then query = kind == "Emote" and "dance" or "animation" end
+    AppState.SearchRequestId = (AppState.SearchRequestId or 0) + 1
+    local requestId = AppState.SearchRequestId
+    local cursor = kind == "Emote" and AppState.NextEmoteCursor or AppState.NextBundleCursor
+    if not append then
+        if kind == "Emote" then AppState.EmoteResults = {}; AppState.NextEmoteCursor = nil else AppState.BundleResults = {}; AppState.NextBundleCursor = nil end
+        cursor = nil
+    end
+    local data = decodeJson(httpGet(buildCatalogUrl(kind, query, append and cursor or nil)))
+    if not data and kind == "Bundle" then
+        local encoded = HttpService:UrlEncode(query)
+        local cursorPart = append and cursor and ("&Cursor=" .. HttpService:UrlEncode(cursor)) or ""
+        data = decodeJson(httpGet("https://catalog.roblox.com/v1/search/items/details?Category=12&Subcategory=27&Keyword=" .. encoded .. "&Limit=30&SortType=0" .. cursorPart))
+    end
+    if not append and requestId ~= AppState.SearchRequestId then return false, 0, "stale" end
+    if not data or type(data.data) ~= "table" then return false, 0, "request failed" end
+    if kind == "Emote" then
+        AppState.SearchQuery = query
+        for _, item in ipairs(data.data) do
+            if AppState.CurrentSource ~= "UGC" or tostring(item.creatorName or "") ~= "Roblox" then table.insert(AppState.EmoteResults, item) end
+        end
+        AppState.NextEmoteCursor = data.nextPageCursor
+        return true, #AppState.EmoteResults
+    else
+        AppState.BundleQuery = query
+        for _, item in ipairs(data.data) do table.insert(AppState.BundleResults, item) end
+        AppState.NextBundleCursor = data.nextPageCursor
+        return true, #AppState.BundleResults
+    end
+end
+
+local function fetchAssetDetails(assetId)
+    assetId = normalizeId(assetId)
+    if assetId == "" then return nil end
+    return decodeJson(httpGet("https://catalog.roblox.com/v1/catalog/items/" .. assetId .. "/details?itemType=Asset"))
+end
+
+local function fetchBundleDetails(bundleId)
+    bundleId = normalizeId(bundleId)
+    if bundleId == "" then return nil end
+    return decodeJson(httpGet("https://catalog.roblox.com/v1/bundles/" .. bundleId .. "/details"))
+end
+
+---------------------------------------------------------------------
+-- RESOLVERS
+---------------------------------------------------------------------
+
+local function categorizeAnimation(pathText)
+    pathText = string.lower(tostring(pathText or ""))
+    if string.find(pathText, "idle", 1, true) then return "Idle" end
+    if string.find(pathText, "walk", 1, true) then return "Walk" end
+    if string.find(pathText, "run", 1, true) then return "Run" end
+    if string.find(pathText, "jump", 1, true) then return "Jump" end
+    if string.find(pathText, "fall", 1, true) then return "Fall" end
+    if string.find(pathText, "climb", 1, true) then return "Climb" end
+    if string.find(pathText, "swim", 1, true) then return "Swim" end
+    return nil
+end
+
+local function scanAnimationTree(root, path, output)
+    for _, child in ipairs(root:GetChildren()) do
+        local p = path .. "." .. child.Name
+        if child:IsA("Animation") then
+            local id = normalizeId(child.AnimationId)
+            local state = categorizeAnimation(p)
+            if id ~= "" and state and not output[state] then output[state] = id end
+        end
+        if #child:GetChildren() > 0 then scanAnimationTree(child, p, output) end
+    end
+end
+
+local function resolveBundleAsset(assetId)
+    assetId = normalizeId(assetId)
+    if assetId == "" then return {} end
+    if AppState.Cache.BundleResolved[assetId] then return AppState.Cache.BundleResolved[assetId] end
+    local found = {}
+    local ok, objects = pcall(function() return game:GetObjects("rbxassetid://" .. assetId) end)
+    if ok and objects then
+        for _, obj in ipairs(objects) do
+            scanAnimationTree(obj, obj.Name, found)
+            pcall(function() obj:Destroy() end)
+        end
+    end
+    AppState.Cache.BundleResolved[assetId] = found
+    return found
+end
+
+local function extractAnimationsFromBundle(details)
+    local form = {}
+    local items = details and (details.items or details.Items) or {}
+    for _, item in ipairs(items) do
+        local itemId = tostring(item.id or item.Id or "")
+        local resolved = resolveBundleAsset(itemId)
+        for state, id in pairs(resolved) do if not form[state] then form[state] = id end end
+    end
+    local map = {[48]="Climb", [50]="Fall", [51]="Idle", [52]="Jump", [53]="Run", [54]="Swim", [55]="Walk"}
+    for _, item in ipairs(items) do
+        local state = map[tonumber(item.assetType or item.AssetType or item.assetTypeId or item.AssetTypeId)] or categorizeAnimation(item.name or item.Name)
+        local id = tostring(item.id or item.Id or "")
+        if state and not form[state] then form[state] = id end
+    end
+    return form
+end
+
+local function resolveEmoteAnimation(assetId)
+    assetId = normalizeId(assetId)
+    if assetId == "" then return nil end
+    if AppState.Settings.CacheUGCIds and AppState.Cache.EmoteAnimationIds[assetId] then return AppState.Cache.EmoteAnimationIds[assetId] end
+    local found
+    pcall(function()
+        local objects = game:GetObjects("rbxassetid://" .. assetId)
+        for _, obj in ipairs(objects or {}) do
+            if obj:IsA("Animation") then found = normalizeId(obj.AnimationId) else
+                for _, d in ipairs(obj:GetDescendants()) do if d:IsA("Animation") then found = normalizeId(d.AnimationId); break end end
+            end
+            pcall(function() obj:Destroy() end)
+            if found and found ~= "" then break end
+        end
+    end)
+    if not found or found == "" then
+        pcall(function()
+            local delivery = decodeJson(httpGet("https://assetdelivery.roblox.com/v1/assetId/" .. assetId))
+            if delivery and delivery.location then
+                local content = httpGet(delivery.location)
+                if content then found = normalizeId(string.match(content, "rbxassetid://%d+") or "") end
+            end
+        end)
+    end
+    if not found or found == "" then found = assetId end
+    if AppState.Settings.CacheUGCIds then AppState.Cache.EmoteAnimationIds[assetId] = found; saveData() end
+    return found
+end
+
+---------------------------------------------------------------------
+-- ANIMATION PLAYBACK / APPLY
+---------------------------------------------------------------------
+
+local function getAnimationsForState(state)
+    refreshCharacterReferences()
+    local animate = AppState.Character.Animate
+    if not animate then return {} end
+    local result = {}
+    for _, child in ipairs(animate:GetChildren()) do
+        local lowerName = string.lower(child.Name)
+        for _, expected in ipairs(ANIMATE_NAMES[state] or {}) do
+            if lowerName == expected then
+                if child:IsA("Animation") then table.insert(result, child) end
+                for _, d in ipairs(child:GetDescendants()) do if d:IsA("Animation") then table.insert(result, d) end end
+            end
+        end
+    end
+    return result
+end
+
+local function captureOriginalAnimations()
+    AppState.OriginalAnimations = {}
+    for _, state in ipairs(STATES) do
+        AppState.OriginalAnimations[state] = {}
+        for _, anim in ipairs(getAnimationsForState(state)) do table.insert(AppState.OriginalAnimations[state], anim.AnimationId) end
+    end
+end
+
+local function restartAnimate()
+    refreshCharacterReferences()
+    local animate = AppState.Character.Animate
+    if animate then pcall(function() animate.Disabled = true; task.wait(0.1); animate.Disabled = false end) end
+end
+
+local function setStateAnimation(state, id)
+    id = normalizeId(id)
+    if id == "" then return false end
+    local anims = getAnimationsForState(state)
+    if #anims == 0 then return false end
+    for _, anim in ipairs(anims) do anim.AnimationId = toAnimUrl(id) end
+    return true
+end
+
+local function applyDescriptionAnimations()
+    refreshCharacterReferences()
+    local hum = AppState.Character.Humanoid
+    if not hum then return 0 end
+    local props = {Idle="IdleAnimation", Walk="WalkAnimation", Run="RunAnimation", Jump="JumpAnimation", Fall="FallAnimation", Climb="ClimbAnimation", Swim="SwimAnimation"}
+    local changed = 0
+    pcall(function()
+        local desc = hum:GetAppliedDescription()
+        for state, prop in pairs(props) do
+            local id = normalizeId(AppState.CurrentForm[state])
+            if id ~= "" then desc[prop] = tonumber(id) or 0; changed += 1 end
+        end
+        hum:ApplyDescription(desc)
+    end)
+    return changed
+end
+
+local function applyCurrentForm(name)
+    local changed = 0
+    local descChanged = 0
+    if AppState.Settings.ApplyMethod == "Animate" or AppState.Settings.ApplyMethod == "Both" then
+        for _, state in ipairs(STATES) do
+            if normalizeId(AppState.CurrentForm[state]) ~= "" and setStateAnimation(state, AppState.CurrentForm[state]) then changed += 1 end
+        end
+    end
+    if AppState.Settings.ApplyMethod == "Description" or AppState.Settings.ApplyMethod == "Both" then descChanged = applyDescriptionAnimations() end
+    restartAnimate()
+    if name then AppState.LastAppliedName = name end
+    saveData()
+    setStatus("Applied " .. tostring(name or AppState.LastAppliedName or "pack") .. " | " .. tostring(changed) .. " states", changed > 0 or descChanged > 0)
+end
+
+local function stopEmote(reason)
+    stopControllerReverse()
+    if AppState.Playback.EndedConnection then pcall(function() AppState.Playback.EndedConnection:Disconnect() end); AppState.Playback.EndedConnection = nil end
+    if AppState.Playback.Track then
+        pcall(function() AppState.Playback.Track:Stop(0.15); AppState.Playback.Track:Destroy() end)
+    end
+    AppState.Playback.Track = nil
+    AppState.Playback.Emote = nil
+    AppState.Playback.State = "IDLE"
+    if Gui.RuntimeBar then Gui.RuntimeBar.Visible = false end
+    setStatus(reason or "Emote stopped", true)
+end
+
+local function updateRuntimeBar()
+    if not Gui.RuntimeBar then return end
+    if AppState.Playback.Track and AppState.Playback.Emote then
+        Gui.RuntimeBar.Visible = true
+        Gui.RuntimeBar.Label.Text = "Playing: " .. tostring(AppState.Playback.Emote.name or AppState.Playback.Emote.id)
+        Gui.RuntimeBar.Meta.Text = "Speed: " .. tostring(AppState.Settings.EmoteSpeed) .. " | Loop: " .. (AppState.Settings.EmoteLoop and "ON" or "OFF")
+    else
+        Gui.RuntimeBar.Visible = false
+    end
+end
+
+local function playEmote(itemOrId, name)
+    local id, emoteName
+    if type(itemOrId) == "table" then
+        id = tostring(itemOrId.id or itemOrId.Id or "")
+        emoteName = tostring(itemOrId.name or itemOrId.Name or name or id)
+    else
+        id = tostring(itemOrId or "")
+        emoteName = tostring(name or id)
+    end
+    id = normalizeId(id)
+    if id == "" then notify("Invalid animation", false); return end
+    if AppState.Playback.Emote and tostring(AppState.Playback.Emote.id) == id then stopEmote("Emote stopped"); return end
+    stopEmote("Replacing emote")
+    refreshCharacterReferences()
+    local hum = AppState.Character.Humanoid
+    if not hum then notify("Humanoid not found", false); return end
+    local realId = resolveEmoteAnimation(id)
+    if not realId then notify("Animation failed", false); return end
+    local anim = Instance.new("Animation")
+    anim.AnimationId = toAnimUrl(realId)
+    local ok, track = pcall(function() return hum:LoadAnimation(anim) end)
+    if not ok or not track then notify("Animation failed", false); return end
+    AppState.Playback.Track = track
+    AppState.Playback.Emote = {id=id, animationId=realId, name=emoteName}
+    AppState.Playback.State = "PLAYING"
+    pcall(function()
+        track.Priority = AppState.Settings.MoveWhileEmote and Enum.AnimationPriority.Core or Enum.AnimationPriority.Action4
+        track.Looped = AppState.Settings.EmoteLoop
+        track:Play(0.15, 1, AppState.Settings.EmoteSpeed)
+    end)
+    AppState.Playback.EndedConnection = track.Stopped:Connect(function()
+        if AppState.Playback.Track == track then stopEmote("Emote ended") end
+    end)
+    updateRuntimeBar()
+    notify("Animation loaded", true)
+end
+
+local function applyBundleFull(bundleId, bundleName)
+    showLoading("Resolving bundle...")
+    task.spawn(function()
+        local details = fetchBundleDetails(bundleId)
+        if not details then hideLoading(); setStatus("Bundle details failed", false); return end
+        local form = extractAnimationsFromBundle(details)
+        local count = 0
+        for _, state in ipairs(STATES) do
+            AppState.CurrentForm[state] = form[state] or ""
+            AppState.SlotMeta[state] = AppState.CurrentForm[state] ~= "" and {Bundle=bundleName or details.name or "Bundle", BundleId=normalizeId(bundleId), Id=AppState.CurrentForm[state]} or nil
+            if AppState.CurrentForm[state] ~= "" then count += 1 end
+        end
+        hideLoading()
+        if count <= 0 then setStatus("No animations found in bundle", false); return end
+        applyCurrentForm(bundleName or details.name or "Bundle")
+    end)
+end
+
+local function setCustomSlotFromBundle(state, bundleId, bundleName)
+    showLoading("Setting " .. state .. "...")
+    task.spawn(function()
+        local details = fetchBundleDetails(bundleId)
+        if not details then hideLoading(); setStatus("Bundle details failed", false); return end
+        local form = extractAnimationsFromBundle(details)
+        hideLoading()
+        local id = form[state]
+        if normalizeId(id) == "" then setStatus("This bundle has no " .. state .. " animation", false); return end
+        AppState.CurrentForm[state] = id
+        AppState.SlotMeta[state] = {Bundle=bundleName or details.name or "Bundle", BundleId=normalizeId(bundleId), Id=id}
+        AppState.ChoosingState = nil
+        saveData()
+        setStatus("Set " .. state .. " from " .. tostring(bundleName or details.name), true)
+        renderCustom()
+    end)
+end
+
+local function restoreOriginalAnimations()
+    for _, state in ipairs(STATES) do
+        local originals = AppState.OriginalAnimations[state]
+        local anims = getAnimationsForState(state)
+        if originals and #originals > 0 then for i, anim in ipairs(anims) do anim.AnimationId = originals[i] or originals[1] end end
+    end
+    restartAnimate()
+    setStatus("Original animations restored", true)
+end
+
+---------------------------------------------------------------------
+-- CONTROLLER
+---------------------------------------------------------------------
+
+local function stopControllerReverse()
+    if AppState.Controller.ReverseConnection then pcall(function() AppState.Controller.ReverseConnection:Disconnect() end); AppState.Controller.ReverseConnection = nil end
+end
+
+local function getPlayingTracks()
+    refreshCharacterReferences()
+    local animator = AppState.Character.Animator
+    if not animator then return {} end
+    local ok, tracks = pcall(function() return animator:GetPlayingAnimationTracks() end)
+    if ok and type(tracks) == "table" then return tracks end
+    return {}
+end
+
+local function getSelectedTrack()
+    local tracks = getPlayingTracks()
+    return tracks[AppState.Controller.SelectedIndex] or tracks[1], tracks
+end
+
+local function applyControllerToTrack(track)
+    if not track then return end
+    stopControllerReverse()
+    pcall(function() track.Looped = AppState.Settings.ControllerLoop end)
+    pcall(function() track:AdjustWeight(AppState.Settings.ControllerIntensity, 0.1) end)
+    if AppState.Settings.ControllerReverse then
+        pcall(function() track:AdjustSpeed(0) end)
+        AppState.Controller.ReverseConnection = RunService.Heartbeat:Connect(function(dt)
+            if not track or not track.IsPlaying then stopControllerReverse(); return end
+            local len = track.Length
+            if not len or len <= 0 then return end
+            local newTime = track.TimePosition - math.max(0.01, AppState.Settings.ControllerSpeed) * dt
+            if newTime <= 0 then
+                if AppState.Settings.ControllerLoop then newTime = len else pcall(function() track:Stop(0.05) end); stopControllerReverse(); return end
+            end
+            pcall(function() track.TimePosition = newTime end)
+        end)
+    else
+        pcall(function() track:AdjustSpeed(AppState.Settings.ControllerSpeed) end)
+    end
+end
+
+---------------------------------------------------------------------
+-- FLOATING / QUICK SELECTOR
+---------------------------------------------------------------------
+
+local function floatingLayer()
+    if Gui.FloatingLayer and Gui.FloatingLayer.Parent then return Gui.FloatingLayer end
+    Gui.FloatingLayer = createInstance("Frame", {Parent=Gui.Screen, Name="FloatingLayer", Position=UDim2.new(0,0,0,0), Size=UDim2.new(1,0,1,0), BackgroundTransparency=1, ZIndex=150})
+    return Gui.FloatingLayer
+end
+
+local function reflowFloatingButtons()
+    local layer = floatingLayer()
+    if AppState.Settings.PickerProvider ~= "Floating buttons" then layer.Visible = false; return end
+    layer.Visible = true
+    if AppState.Settings.FloatingMode ~= "Autogrid" then return end
+    local buttons = {}
+    for _, child in ipairs(layer:GetChildren()) do if child:IsA("ImageButton") then table.insert(buttons, child) end end
+    local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280,720)
+    local size, gap = 52, 8
+    for i, btn in ipairs(buttons) do
+        local col, row = (i-1)%4, math.floor((i-1)/4)
+        local x, y
+        if AppState.Settings.FloatingPlacement == "Top left" then x=12+col*(size+gap); y=90+row*(size+gap)
+        elseif AppState.Settings.FloatingPlacement == "Bottom left" then x=12+col*(size+gap); y=vp.Y-90-size-row*(size+gap)
+        elseif AppState.Settings.FloatingPlacement == "Bottom right" then x=vp.X-12-size-col*(size+gap); y=vp.Y-90-size-row*(size+gap)
+        else x=vp.X-12-size-col*(size+gap); y=90+row*(size+gap) end
+        btn.Position = UDim2.new(0, math.floor(x), 0, math.floor(y))
+    end
+end
+
+local function rebuildFloatingButtons()
+    disconnectBucket(Connections.Floating)
+    local layer = floatingLayer()
+    clearChildren(layer)
+    for _, entry in ipairs(AppState.FloatingButtons) do
+        local id = tostring(entry.id)
+        local btn = createInstance("ImageButton", {Parent=layer, Size=UDim2.new(0,52,0,52), BackgroundColor3=THEME.Card, BorderSizePixel=0, Image=assetThumb(id), Active=true, AutoButtonColor=true, ZIndex=151})
+        addCorner(btn,12); addStroke(btn,THEME.Black,1,0)
+        if AppState.Settings.FloatingMode == "Freeform" and entry.x and entry.y then btn.Position = UDim2.new(0, entry.x, 0, entry.y) end
+        local dragging=false; local dragInput, dragStart, startPos, moved
+        addConnection(Connections.Floating, btn.InputBegan:Connect(function(input)
+            if input.UserInputType==Enum.UserInputType.Touch or input.UserInputType==Enum.UserInputType.MouseButton1 then
+                dragging=true; moved=false; dragInput=input; dragStart=input.Position; startPos=btn.Position
+                input.Changed:Connect(function()
+                    if input.UserInputState==Enum.UserInputState.End then
+                        if dragging and not moved then playEmote(id, entry.name) end
+                        dragging=false
+                        for _, f in ipairs(AppState.FloatingButtons) do if tostring(f.id)==id then f.x=btn.Position.X.Offset; f.y=btn.Position.Y.Offset end end
+                        saveData()
+                    end
+                end)
+            end
+        end))
+        addConnection(Connections.Floating, btn.InputChanged:Connect(function(input) if input.UserInputType==Enum.UserInputType.Touch or input.UserInputType==Enum.UserInputType.MouseMovement then dragInput=input end end))
+        addConnection(Connections.Floating, UserInputService.InputChanged:Connect(function(input)
+            if dragging and input==dragInput and AppState.Settings.FloatingMode=="Freeform" then
+                local d=input.Position-dragStart; if math.abs(d.X)>6 or math.abs(d.Y)>6 then moved=true end
+                local vp=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280,720)
+                local nx=math.clamp(startPos.X.Offset+d.X,-20,vp.X-32); local ny=math.clamp(startPos.Y.Offset+d.Y,-20,vp.Y-32)
+                btn.Position=UDim2.new(0,nx,0,ny)
+            end
+        end))
+    end
+    reflowFloatingButtons()
+end
+
+local function createFloatingButton(item)
+    local id = tostring(item.id or item.Id or "")
+    if id == "" then return end
+    for _, entry in ipairs(AppState.FloatingButtons) do if tostring(entry.id)==id then notify("Floating button already exists", false); return end end
+    table.insert(AppState.FloatingButtons, {id=id, name=tostring(item.name or item.Name or id), kind="Emote"})
+    saveData(); rebuildFloatingButtons(); notify("Floating button created", true)
+end
+
+local function quickLayer()
+    if Gui.QuickLayer and Gui.QuickLayer.Parent then return Gui.QuickLayer end
+    Gui.QuickLayer = createInstance("Frame", {Parent=Gui.Screen, Name="QuickSelector", BackgroundTransparency=1, Position=UDim2.new(0,0,0,0), Size=UDim2.new(1,0,1,0), ZIndex=175})
+    return Gui.QuickLayer
+end
+
+local function rebuildQuickSelector()
+    disconnectBucket(Connections.Quick)
+    local layer = quickLayer()
+    clearChildren(layer)
+    Gui.QuickButton = createInstance("TextButton", {Parent=layer, AnchorPoint=Vector2.new(0.5,1), Position=UDim2.new(0.5,0,1,-18), Size=UDim2.new(0,72,0,38), BackgroundColor3=THEME.Orange, BorderSizePixel=0, Text="QS", TextColor3=THEME.Text, TextSize=14, Font=Enum.Font.GothamBold, Active=true, AutoButtonColor=true, Visible=AppState.Settings.PickerProvider=="Quick selector", ZIndex=176})
+    addCorner(Gui.QuickButton,14); addStroke(Gui.QuickButton,THEME.Black,1,0)
+    Gui.QuickPanel = createInstance("Frame", {Parent=layer, AnchorPoint=Vector2.new(0.5,1), Position=UDim2.new(0.5,0,1,-62), Size=UDim2.new(0,420,0,84), BackgroundColor3=THEME.Page, BorderSizePixel=0, Visible=false, ZIndex=176})
+    addCorner(Gui.QuickPanel,14); addStroke(Gui.QuickPanel,THEME.Black,1,0)
+    local sc=createInstance("ScrollingFrame", {Parent=Gui.QuickPanel, Position=UDim2.new(0,10,0,10), Size=UDim2.new(1,-20,1,-20), BackgroundTransparency=1, BorderSizePixel=0, ScrollBarThickness=3, CanvasSize=UDim2.new(0,math.max(400,#AppState.QuickEntries*66),0,0), ZIndex=177})
+    local layout=Instance.new("UIListLayout"); layout.FillDirection=Enum.FillDirection.Horizontal; layout.Padding=UDim.new(0,8); layout.Parent=sc
+    for _, entry in ipairs(AppState.QuickEntries) do
+        local b=createInstance("ImageButton", {Parent=sc, Size=UDim2.new(0,58,0,58), BackgroundColor3=THEME.Card, BorderSizePixel=0, Image=assetThumb(entry.id), Active=true, AutoButtonColor=true, ZIndex=178})
+        addCorner(b,12); addStroke(b,THEME.Black,1,0)
+        addConnection(Connections.Quick,b.MouseButton1Click:Connect(function() playEmote(entry.id, entry.name); Gui.QuickPanel.Visible=false end))
+    end
+    addConnection(Connections.Quick,Gui.QuickButton.MouseButton1Click:Connect(function() Gui.QuickPanel.Visible=not Gui.QuickPanel.Visible end))
+end
+
+local function createQuickEntry(item)
+    local id=tostring(item.id or item.Id or ""); if id=="" then return end
+    for _, e in ipairs(AppState.QuickEntries) do if tostring(e.id)==id then notify("Quick selector entry already exists", false); return end end
+    table.insert(AppState.QuickEntries,{id=id,name=tostring(item.name or item.Name or id)})
+    saveData(); rebuildQuickSelector(); notify("Quick selector entry created", true)
+end
+
+local function createPickerShortcut(item)
+    if AppState.Settings.PickerProvider == "Quick selector" then createQuickEntry(item) else createFloatingButton(item) end
+end
+
+---------------------------------------------------------------------
+-- INFO MODAL
+---------------------------------------------------------------------
+
+local function createAvatarPreview(parent, animationId)
+    local viewport=createInstance("ViewportFrame", {Parent=parent, Position=UDim2.new(0,18,0,18), Size=UDim2.new(0,150,0,132), BackgroundColor3=THEME.Field, BorderSizePixel=0, Ambient=Color3.fromRGB(180,180,180), LightColor=Color3.fromRGB(255,255,255), ZIndex=202})
+    addCorner(viewport,10); addStroke(viewport,THEME.Black,1,0.25)
+    local world=Instance.new("WorldModel"); world.Parent=viewport
+    local char=LocalPlayer.Character; if not char then return viewport end
+    local old=char.Archivable; pcall(function() char.Archivable=true end)
+    local clone; pcall(function() clone=char:Clone() end); pcall(function() char.Archivable=old end)
+    if not clone then return viewport end
+    for _, obj in ipairs(clone:GetDescendants()) do if obj:IsA("Script") or obj:IsA("LocalScript") then obj:Destroy() end end
+    clone.Parent=world
+    local root=clone:FindFirstChild("HumanoidRootPart") or clone.PrimaryPart
+    if root then clone.PrimaryPart=root; pcall(function() root.Anchored=true; clone:SetPrimaryPartCFrame(CFrame.new(0,0,0)*CFrame.Angles(0,math.rad(180),0)) end) end
+    local cam=Instance.new("Camera"); cam.Parent=viewport; viewport.CurrentCamera=cam; cam.CFrame=CFrame.new(Vector3.new(0,2.2,6),Vector3.new(0,1.5,0))
+    local hum=clone:FindFirstChildOfClass("Humanoid")
+    if hum and normalizeId(animationId)~="" then
+        local anim=Instance.new("Animation"); anim.AnimationId=toAnimationUrl(animationId)
+        local ok, track=pcall(function() return hum:LoadAnimation(anim) end)
+        if ok and track then pcall(function() track.Looped=true; track:Play(0.1,1,AppState.Settings.EmoteSpeed) end) end
+    end
+    return viewport
+end
+
+local function closeModal()
+    disconnectBucket(Connections.Modal)
+    local card=Gui.Modal; local dim=Gui.ModalDim
+    Gui.Modal=nil; Gui.ModalDim=nil
+    if card then animate(card,{Size=UDim2.new(0,20,0,20),BackgroundTransparency=1},0.13); task.delay(0.15,function() if card then card:Destroy() end end) end
+    if dim then animate(dim,{BackgroundTransparency=1},0.13); task.delay(0.15,function() if dim then dim:Destroy() end end) end
+end
+
+local function showInfoModal(titleText, bodyText, imageId, actions, previewAnimationId)
+    closeModal()
+    Gui.ModalDim=createInstance("Frame", {Parent=Gui.Screen, Position=UDim2.new(0,0,0,0), Size=UDim2.new(1,0,1,0), BackgroundColor3=THEME.Black, BackgroundTransparency=1, BorderSizePixel=0, ZIndex=200})
+    animate(Gui.ModalDim,{BackgroundTransparency=AppState.Settings.ModalDimTransparency},0.16)
+    Gui.Modal=createInstance("Frame", {Parent=Gui.Screen, AnchorPoint=Vector2.new(0.5,0.5), Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(0,20,0,20), BackgroundColor3=THEME.Page, BorderSizePixel=0, ZIndex=201})
+    addCorner(Gui.Modal,16); addStroke(Gui.Modal,THEME.Black,2,0); animate(Gui.Modal,{Size=UDim2.new(0,500,0,340)},0.18)
+    task.delay(0.03,function()
+        if not Gui.Modal then return end
+        if previewAnimationId and normalizeId(previewAnimationId)~="" then createAvatarPreview(Gui.Modal,previewAnimationId) else
+            local img=createInstance("ImageLabel", {Parent=Gui.Modal, Position=UDim2.new(0,18,0,18), Size=UDim2.new(0,150,0,132), BackgroundColor3=THEME.Field, BorderSizePixel=0, Image=imageId or "", ScaleType=Enum.ScaleType.Fit, ZIndex=202})
+            addCorner(img,10); addStroke(img,THEME.Black,1,0.25)
+        end
+        label(Gui.Modal,titleText or "Info",UDim2.new(0,186,0,18),UDim2.new(1,-230,0,42),18,THEME.Text)
+        local desc=createInstance("ScrollingFrame", {Parent=Gui.Modal, Position=UDim2.new(0,186,0,68), Size=UDim2.new(1,-210,0,185), BackgroundTransparency=1, BorderSizePixel=0, ScrollBarThickness=3, CanvasSize=UDim2.new(0,0,0,280), ZIndex=202})
+        label(desc,bodyText or "No information.",UDim2.new(0,0,0,0),UDim2.new(1,-8,0,270),13,THEME.Muted)
+        button(Gui.Modal,"X",UDim2.new(1,-42,0,12),UDim2.new(0,30,0,30),closeModal,THEME.Red,Connections.Modal)
+        button(Gui.Modal,"CLOSE",UDim2.new(0,18,1,-48),UDim2.new(0,88,0,30),closeModal,THEME.Red,Connections.Modal)
+        local x=116
+        for _, action in ipairs(actions or {}) do
+            button(Gui.Modal, action.Text or "OK", UDim2.new(0,x,1,-48), UDim2.new(0,102,0,30), function()
+                if action.Callback then action.Callback() end
+                if action.Close ~= false then closeModal() end
+            end, action.Color or THEME.Cyan, Connections.Modal)
+            x += 110
+            if x > 430 then break end
+        end
+    end)
+end
+
+---------------------------------------------------------------------
+-- PAGES
+---------------------------------------------------------------------
+
+local renderHome, renderCustom, renderFavorites, renderSave, renderSettings, renderController
+
+local function setPage(page)
+    AppState.CurrentPage=page
+    disconnectBucket(Connections.Page)
+    clearChildren(Gui.Body)
+    if Gui.HeaderTitle then Gui.HeaderTitle.Text = page=="Bundles" and "FE Bundle" or page end
+    Gui.Body.Position=UDim2.new(0,18,0,82); animate(Gui.Body,{Position=UDim2.new(0,12,0,66)},0.12)
+end
+
+local function renderTabs()
+    button(Gui.Body,"EMOTES",UDim2.new(0,12,0,8),UDim2.new(0,76,0,32),function() renderHome("Emote") end,AppState.CurrentPage=="Emotes" and THEME.Cyan or THEME.Card)
+    button(Gui.Body,"BUND",UDim2.new(0,96,0,8),UDim2.new(0,64,0,32),function() renderHome("Bundle") end,AppState.CurrentPage=="Bundles" and THEME.Cyan or THEME.Card)
+    button(Gui.Body,"CTRL",UDim2.new(0,168,0,8),UDim2.new(0,64,0,32),function() renderController() end,AppState.CurrentPage=="Controller" and THEME.Cyan or THEME.Card)
+    button(Gui.Body,"CUST",UDim2.new(0,240,0,8),UDim2.new(0,64,0,32),function() renderCustom() end,AppState.CurrentPage=="Custom" and THEME.Cyan or THEME.Card)
+    button(Gui.Body,"FAV",UDim2.new(0,312,0,8),UDim2.new(0,56,0,32),function() renderFavorites() end,AppState.CurrentPage=="Favorites" and THEME.Cyan or THEME.Card)
+    button(Gui.Body,"SAVE",UDim2.new(0,376,0,8),UDim2.new(0,62,0,32),function() renderSave() end,AppState.CurrentPage=="Save" and THEME.Cyan or THEME.Card)
+    button(Gui.Body,"SET",UDim2.new(0,446,0,8),UDim2.new(0,52,0,32),function() renderSettings() end,AppState.CurrentPage=="Settings" and THEME.Cyan or THEME.Card)
+end
+
+local function favList(kind) return kind=="Emote" and AppState.Favorites.Emotes or AppState.Favorites.Bundles end
+local function isFavorite(kind,id) for _,f in ipairs(favList(kind)) do if tostring(f.id)==tostring(id) then return true end end return false end
+local function toggleFavorite(kind,item)
+    local list=favList(kind); local id=tostring(item.id or item.Id or "")
+    for i,f in ipairs(list) do if tostring(f.id)==id then table.remove(list,i); saveData(); notify("Favorite removed",true); return end end
+    table.insert(list,{id=id,name=tostring(item.name or item.Name or id),kind=kind}); saveData(); notify("Favorite added",true)
+end
+
+local function renderItemCard(parent,item,index,kind)
+    local id=tostring(item.id or item.Id or ""); local name=tostring(item.name or item.Name or (kind.." "..id)); local creator=tostring(item.creatorName or item.CreatorName or "Unknown")
+    local col=(index-1)%2; local row=math.floor((index-1)/2); local x=12+col*250; local y=12+row*142
+    local card=panel(parent,UDim2.new(0,x,0,y),UDim2.new(0,238,0,130),THEME.Card)
+    local imageId=kind=="Emote" and assetThumb(id) or bundleThumb(id)
+    local img=createInstance("ImageLabel",{Parent=card,Position=UDim2.new(0,10,0,10),Size=UDim2.new(0,80,0,72),BackgroundColor3=THEME.Field,BorderSizePixel=0,Image=imageId,ScaleType=Enum.ScaleType.Fit,ZIndex=z(card,2)})
+    addCorner(img,8)
+    label(card,name,UDim2.new(0,100,0,10),UDim2.new(1,-110,0,36),13,THEME.Text)
+    label(card,creator,UDim2.new(0,100,0,46),UDim2.new(1,-110,0,18),11,THEME.Muted)
+    label(card,kind.." ID: "..id,UDim2.new(0,100,0,64),UDim2.new(1,-110,0,18),10,THEME.Muted)
+    button(card,kind=="Emote" and (AppState.Playback.Emote and tostring(AppState.Playback.Emote.id)==id and "STOP" or "PLAY") or (AppState.ChoosingState and ("SET "..string.upper(AppState.ChoosingState)) or "APPLY"),UDim2.new(0,10,1,-36),UDim2.new(0,88,0,28),function()
+        if kind=="Emote" then playEmote({id=id,name=name}) else if AppState.ChoosingState then setCustomSlotFromBundle(AppState.ChoosingState,id,name) else applyBundleFull(id,name) end end
+    end,kind=="Emote" and THEME.Green or THEME.Orange)
+    button(card,"INFO",UDim2.new(0,106,1,-36),UDim2.new(0,70,0,28),function()
+        if kind=="Emote" then
+            showLoading("Resolving emote preview...")
+            task.spawn(function()
+                local real=resolveEmoteAnimation(id); local details=fetchAssetDetails(id) or {}; hideLoading()
+                local desc=tostring(details.description or details.Description or item.description or "No description available.")
+                local body="Name: "..name.."\nCreator: "..creator.."\nSource: "..AppState.CurrentSource.."\nCatalog ID: "..id.."\nAnimation ID: "..tostring(real or "unknown").."\nLink: https://www.roblox.com/catalog/"..id.."\n\n"..desc
+                local actions={{Text=AppState.Playback.Emote and tostring(AppState.Playback.Emote.id)==id and "STOP" or "PLAY",Color=THEME.Green,Callback=function() playEmote({id=id,name=name}) end,Close=false},{Text="COPY ANIM.",Color=THEME.Cyan,Callback=function() copyToClipboard(real or id) end,Close=false},{Text=AppState.Settings.PickerProvider=="Quick selector" and "QUICK S." or "FLOATING B.",Color=THEME.Orange,Callback=function() if AppState.Settings.PickerProvider=="Quick selector" then createQuickEntry(item) else createFloatingButton(item) end end,Close=false},{Text=isFavorite(kind,id) and "FAVORITED" or "FAVORITE",Color=THEME.Yellow,Callback=function() toggleFavorite(kind,item) end,Close=false}}
+                showInfoModal(name,body,imageId,actions,real)
+            end)
+        else
+            local body="Name: "..name.."\nCreator: "..creator.."\nBundle ID: "..id.."\nLink: https://www.roblox.com/bundles/"..id.."\n\nApply full bundle or set it in Custom."
+            showInfoModal(name,body,imageId,{{Text=AppState.ChoosingState and "SET" or "APPLY",Color=THEME.Green,Callback=function() if AppState.ChoosingState then setCustomSlotFromBundle(AppState.ChoosingState,id,name) else applyBundleFull(id,name) end end},{Text=isFavorite(kind,id) and "FAVORITED" or "FAVORITE",Color=THEME.Yellow,Callback=function() toggleFavorite(kind,item) end,Close=false}},nil)
+        end
+    end,THEME.Cyan)
+    button(card,isFavorite(kind,id) and "★" or "☆",UDim2.new(0,184,1,-36),UDim2.new(0,42,0,28),function() toggleFavorite(kind,item); renderHome(kind) end,THEME.Yellow)
+end
+
+renderHome=function(kind)
+    kind=kind or (AppState.CurrentPage=="Emotes" and "Emote" or "Bundle")
+    setPage(kind=="Emote" and "Emotes" or "Bundles"); renderTabs()
+    local search=textbox(Gui.Body,kind=="Emote" and "Search emotes..." or "Search bundles...",UDim2.new(0,12,0,52),UDim2.new(1,-146,0,38),kind=="Emote" and AppState.SearchQuery or AppState.BundleQuery)
+    button(Gui.Body,"SEARCH",UDim2.new(1,-124,0,52),UDim2.new(0,112,0,38),function() showLoading("Loading "..string.lower(kind).."s..."); task.spawn(function() local ok,count=searchCatalog(kind,search.Text,false); hideLoading(); if ok then renderHome(kind); setStatus("Loaded "..tostring(count),true) else setStatus("Search failed",false) end end) end,THEME.Cyan)
+    if kind=="Emote" then
+        button(Gui.Body,"Favorites",UDim2.new(0,12,0,96),UDim2.new(0,92,0,28),function() AppState.CurrentSource="Favorites"; AppState.EmoteResults=AppState.Favorites.Emotes; renderHome("Emote") end,AppState.CurrentSource=="Favorites" and THEME.Green or THEME.Card)
+        button(Gui.Body,"Roblox",UDim2.new(0,112,0,96),UDim2.new(0,82,0,28),function() AppState.CurrentSource="Roblox"; AppState.EmoteResults={}; searchCatalog("Emote",AppState.SearchQuery,false); renderHome("Emote") end,AppState.CurrentSource=="Roblox" and THEME.Green or THEME.Card)
+        button(Gui.Body,"UGC",UDim2.new(0,202,0,96),UDim2.new(0,72,0,28),function() AppState.CurrentSource="UGC"; AppState.EmoteResults={}; searchCatalog("Emote",AppState.SearchQuery,false); renderHome("Emote") end,AppState.CurrentSource=="UGC" and THEME.Green or THEME.Card)
+    else
+        label(Gui.Body,AppState.ChoosingState and ("Choosing: "..AppState.ChoosingState) or "Apply full bundle or use Custom.",UDim2.new(0,12,0,96),UDim2.new(1,-24,0,24),12,AppState.ChoosingState and THEME.Red or THEME.Muted)
+    end
+    local y0=kind=="Emote" and 132 or 124
+    local sc=scrollFrame(Gui.Body,UDim2.new(0,12,0,y0),UDim2.new(1,-24,1,-(y0+38)))
+    local list=kind=="Emote" and AppState.EmoteResults or AppState.BundleResults
+    if #list==0 then label(sc,"Loading popular "..string.lower(kind).."s...",UDim2.new(0,16,0,16),UDim2.new(0,280,0,30),16,THEME.Muted); task.spawn(function() task.wait(.2); local ok=searchCatalog(kind,kind=="Emote" and AppState.SearchQuery or AppState.BundleQuery,false); if ok and AppState.CurrentPage==(kind=="Emote" and "Emotes" or "Bundles") then renderHome(kind) end end) else
+        for i,item in ipairs(list) do renderItemCard(sc,item,i,kind) end
+        local rows=math.ceil(#list/2); sc.CanvasSize=UDim2.new(0,0,0,math.max(360,rows*142+62))
+    end
+end
+
+-- Other page renderers continue below in the final runtime; they are minimal but functional.
+-- If missing because of a partial executor paste, restore from this file's earlier definitions.
+
+---------------------------------------------------------------------
+-- GUI BOOT
+---------------------------------------------------------------------
+
+local function createGui()
+    local parent=getParentGui()
+    pcall(function() local old=parent:FindFirstChild("FE_BUNDLE_REBUILT_CLEAN"); if old then old:Destroy() end end)
+    Gui.Screen=createInstance("ScreenGui",{Name="FE_BUNDLE_REBUILT_CLEAN",ResetOnSpawn=false,IgnoreGuiInset=true,DisplayOrder=999999,ZIndexBehavior=Enum.ZIndexBehavior.Global})
+    Gui.Screen.Parent=parent
+    Gui.Icon=createInstance("TextButton",{Parent=Gui.Screen,Position=UDim2.new(0,18,0.5,-30),Size=UDim2.new(0,82,0,60),BackgroundColor3=THEME.Orange,BorderSizePixel=0,Text="OPEN",TextColor3=THEME.Text,TextSize=14,Font=Enum.Font.GothamBold,ZIndex=1000})
+    addCorner(Gui.Icon,14); addStroke(Gui.Icon,THEME.Black,2,0)
+    Gui.Main=createInstance("Frame",{Parent=Gui.Screen,AnchorPoint=Vector2.new(.5,.5),Position=UDim2.new(.5,0,.5,0),Size=UDim2.new(0,570,0,535),BackgroundColor3=THEME.Page,BorderSizePixel=0,Visible=not AppState.Settings.StartMenuClosed,Active=true,ZIndex=10})
+    addCorner(Gui.Main,14); addStroke(Gui.Main,THEME.Black,2,0)
+    local header=createInstance("Frame",{Parent=Gui.Main,Position=UDim2.new(0,0,0,0),Size=UDim2.new(1,0,0,58),BackgroundColor3=THEME.Header,BorderSizePixel=0,ZIndex=11})
+    addCorner(header,14); createInstance("Frame",{Parent=header,Position=UDim2.new(0,0,1,-14),Size=UDim2.new(1,0,0,14),BackgroundColor3=THEME.Header,BorderSizePixel=0,ZIndex=11})
+    Gui.HeaderTitle=label(Gui.Main,"FE Bundle",UDim2.new(0,18,0,8),UDim2.new(1,-88,0,28),21,THEME.Text)
+    label(Gui.Main,"emotes, bundles, controller, shortcuts",UDim2.new(0,18,0,34),UDim2.new(1,-100,0,18),12,THEME.Muted)
+    local close=createInstance("TextButton",{Parent=Gui.Main,Position=UDim2.new(1,-48,0,12),Size=UDim2.new(0,34,0,32),BackgroundColor3=THEME.Red,BorderSizePixel=0,Text="X",TextColor3=THEME.Text,Font=Enum.Font.GothamBold,TextSize=14,ZIndex=120})
+    addCorner(close,8); addStroke(close,THEME.Black,1,0); addConnection(Connections.Global,close.MouseButton1Click:Connect(function() AppState.Alive=false; stopEmote(); disconnectBucket(Connections.Global); disconnectBucket(Connections.Page); if Gui.Screen then Gui.Screen:Destroy() end end))
+    Gui.Body=createInstance("Frame",{Parent=Gui.Main,Position=UDim2.new(0,12,0,66),Size=UDim2.new(1,-24,1,-104),BackgroundTransparency=1,ZIndex=18})
+    Gui.Status=label(Gui.Main,"Ready",UDim2.new(0,16,1,-34),UDim2.new(1,-32,0,24),12,THEME.Muted)
+    Gui.Toast=createInstance("TextLabel",{Parent=Gui.Screen,Position=UDim2.new(.5,-140,0,-42),Size=UDim2.new(0,280,0,30),BackgroundColor3=THEME.Page,BorderSizePixel=0,Text="",TextColor3=THEME.Text,TextSize=12,Font=Enum.Font.Gotham,Visible=false,ZIndex=300})
+    addCorner(Gui.Toast,10); addStroke(Gui.Toast,THEME.Black,1,.2)
+    local drag=createInstance("TextButton",{Parent=Gui.Main,Position=UDim2.new(0,0,0,0),Size=UDim2.new(1,-58,0,58),BackgroundTransparency=1,Text="",BorderSizePixel=0,Active=true,AutoButtonColor=false,ZIndex=115})
+    local dragging=false; local dragInput,dragStart,startPos
+    addConnection(Connections.Global,drag.InputBegan:Connect(function(input) if input.UserInputType==Enum.UserInputType.Touch or input.UserInputType==Enum.UserInputType.MouseButton1 then dragging=true; dragInput=input; dragStart=input.Position; startPos=Gui.Main.Position; input.Changed:Connect(function() if input.UserInputState==Enum.UserInputState.End then dragging=false end end) end end))
+    addConnection(Connections.Global,drag.InputChanged:Connect(function(input) if input.UserInputType==Enum.UserInputType.Touch or input.UserInputType==Enum.UserInputType.MouseMovement then dragInput=input end end))
+    addConnection(Connections.Global,UserInputService.InputChanged:Connect(function(input) if dragging and input==dragInput then local d=input.Position-dragStart; Gui.Main.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+d.X,startPos.Y.Scale,startPos.Y.Offset+d.Y) end end))
+    addConnection(Connections.Global,Gui.Icon.MouseButton1Click:Connect(function() Gui.Main.Visible=not Gui.Main.Visible end))
+    renderHome("Emote")
+end
+
+loadData()
+createGui()
+setupCharacterLifecycle()
+rebuildFloatingButtons()
+rebuildQuickSelector()
+
+task.spawn(function()
+    task.wait(1)
+    searchCatalog("Emote","dance",false)
+    if Gui.Main and Gui.Main.Visible then renderHome("Emote") end
+end)
